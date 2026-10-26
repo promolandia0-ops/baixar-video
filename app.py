@@ -10,7 +10,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 import requests
-from flask import Flask, jsonify, request, send_file, send_from_directory
+from flask import Flask, Response, jsonify, request, send_file, send_from_directory
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 
@@ -78,38 +78,27 @@ def _score_media(u: str) -> int:
         score -= 100
     if "/get_file/" in low:
         score += 20
-    if low.endswith(".m3u8") or ".m3u8?" in low:
+    if "v-acctoken" in low or "acctoken" in low:
+        score += 50  # KVS hotlink token — required to avoid 403
+    if low.endswith(".m3u8") or ".m3u8?" in low or ".m3u8/" in low:
         score += 5
     if ".mp4" in low:
         score += 15
     return score
 
 
-def _extract_html_media(page_url: str) -> dict | None:
-    """Fallback when yt-dlp fails: scrape direct mp4/m3u8 / KVS video_url."""
-    try:
-        r = requests.get(
-            page_url,
-            headers={"User-Agent": UA, "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8"},
-            timeout=25,
-            allow_redirects=True,
-        )
-        r.raise_for_status()
-    except requests.RequestException:
-        return None
 
-    html = r.text
+def _parse_media_from_html(page_url: str, html: str) -> dict | None:
+    """Parse direct mp4/m3u8 / KVS video_url from HTML."""
     candidates: list[str] = []
 
-    # KVS style: video_url: '...'
     for m in re.finditer(
-        r"""video_url\s*:\s*['"]([^'"]+)['"]""",
+        r"""video_(?:alt_)?url\s*:\s*['"]([^'"]+)['"]""",
         html,
         re.I,
     ):
         candidates.append(unescape(m.group(1)))
 
-    # HTML5 <source src="..."> / <video src="...">
     for m in re.finditer(
         r"""<(?:source|video)[^>]+src=["']([^"']+)["']""",
         html,
@@ -117,9 +106,8 @@ def _extract_html_media(page_url: str) -> dict | None:
     ):
         candidates.append(unescape(m.group(1)))
 
-    # Any absolute/relative get_file or media URL in page
     for m in re.finditer(
-        r"""https?://[^\s"'<>]+?\.(?:mp4|m3u8|webm)(?:\?[^\s"'<>]*)?""",
+        r"""https?://[^\s"'<>]+?\.(?:mp4|m3u8|webm)/?(?:\?[^\s"'<>]*)?""",
         html,
         re.I,
     ):
@@ -132,7 +120,6 @@ def _extract_html_media(page_url: str) -> dict | None:
     ):
         candidates.append(unescape(m.group(1)))
 
-    # function_get_file / kt_player flashvars variants
     for m in re.finditer(
         r"""['"](/(?:get_file|contents)[^'"]+\.mp4[^'"]*)['"]""",
         html,
@@ -150,7 +137,7 @@ def _extract_html_media(page_url: str) -> dict | None:
         if full in seen:
             continue
         seen.add(full)
-        if not re.search(r"\.(mp4|m3u8|webm)(\?|$)", full, re.I):
+        if not re.search(r"\.(mp4|m3u8|webm)(/|\?|$)", full, re.I):
             continue
         abs_urls.append(full)
 
@@ -181,6 +168,29 @@ def _extract_html_media(page_url: str) -> dict | None:
         "ext": "mp4" if ".mp4" in best.lower() else ("m3u8" if ".m3u8" in best.lower() else "webm"),
         "candidates": abs_urls[:5],
     }
+
+
+def _fetch_page(page_url: str, session: requests.Session | None = None) -> tuple[requests.Session, str]:
+    s = session or requests.Session()
+    s.headers.update(
+        {
+            "User-Agent": UA,
+            "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+    )
+    r = s.get(page_url, timeout=25, allow_redirects=True)
+    r.raise_for_status()
+    return s, r.text
+
+
+def _extract_html_media(page_url: str, session: requests.Session | None = None) -> dict | None:
+    """Fallback when yt-dlp fails: scrape direct mp4/m3u8 / KVS video_url."""
+    try:
+        _s, html = _fetch_page(page_url, session)
+    except requests.RequestException:
+        return None
+    return _parse_media_from_html(page_url, html)
 
 
 @app.get("/")
@@ -287,15 +297,19 @@ def api_download():
         return jsonify({"ok": False, "error": f"Erro: {e}"}), 500
 
     # 2) HTML fallback (KVS / embedded mp4) — video mode only
+    # Many tube sites bind get_file tokens to IP/cookies, so we PROXY through this server
+    # instead of giving the user a direct URL (which returns 403 on their phone).
     if mode == "video":
         fb = _extract_html_media(url)
         if fb and fb.get("url"):
+            filename = _safe_name(fb.get("title"), fb.get("ext") or "mp4")
             return jsonify(
                 {
                     "ok": True,
-                    "method": "redirect",
-                    "url": fb["url"],
-                    "filename": _safe_name(fb.get("title"), fb.get("ext") or "mp4"),
+                    "method": "proxy",
+                    "url": "/api/proxy",
+                    "page_url": url,
+                    "filename": filename,
                     "title": fb.get("title") or "Vídeo",
                 }
             )
@@ -358,6 +372,79 @@ def api_download():
         mimetype="application/octet-stream",
         max_age=0,
     )
+
+
+@app.post("/api/proxy")
+def api_proxy():
+    """Stream media using the SAME session/cookies that opened the page (avoids 403)."""
+    data = request.get_json(silent=True) or {}
+    try:
+        page_url = _clean_url(data.get("page_url") or data.get("url") or "")
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+    try:
+        session, html = _fetch_page(page_url)
+    except requests.RequestException as e:
+        return jsonify({"ok": False, "error": f"Não abri a página: {e}"}), 502
+
+    fb = _parse_media_from_html(page_url, html)
+    if not fb or not fb.get("url"):
+        return jsonify({"ok": False, "error": "Não achei o arquivo de vídeo nessa página."}), 422
+
+    media_url = fb["url"]
+    filename = _safe_name(fb.get("title"), fb.get("ext") or "mp4")
+    origin = f"{urlparse(page_url).scheme}://{urlparse(page_url).netloc}"
+
+    try:
+        r = session.get(
+            media_url,
+            headers={
+                "Referer": page_url,
+                "Origin": origin,
+                "Accept": "*/*",
+            },
+            stream=True,
+            timeout=120,
+            allow_redirects=True,
+        )
+    except requests.RequestException as e:
+        return jsonify({"ok": False, "error": f"Falha ao buscar o vídeo: {e}"}), 502
+
+    if r.status_code >= 400:
+        body = ""
+        try:
+            body = r.text[:120]
+        except Exception:
+            pass
+        r.close()
+        return jsonify(
+            {
+                "ok": False,
+                "error": f"O site de origem recusou o download (HTTP {r.status_code}). {body}".strip(),
+            }
+        ), 502
+
+    content_type = r.headers.get("Content-Type") or "video/mp4"
+
+    def generate():
+        try:
+            for chunk in r.iter_content(chunk_size=256 * 1024):
+                if chunk:
+                    yield chunk
+        finally:
+            r.close()
+
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Cache-Control": "no-store",
+    }
+    cl = r.headers.get("Content-Length")
+    if cl:
+        headers["Content-Length"] = cl
+
+    return Response(generate(), headers=headers, mimetype=content_type)
+
 
 
 if __name__ == "__main__":

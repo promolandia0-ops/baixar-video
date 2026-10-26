@@ -205,6 +205,31 @@
             setStatus("Pronto. Se não baixou, o site de origem bloqueou o link direto — tenta de novo ou outro link.", "ok");
             return;
           }
+          if (data.method === "proxy") {
+            setStatus("Baixando pelo servidor (pode demorar)…", "");
+            const proxyRes = await fetch(data.url || "/api/proxy", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ page_url: data.page_url || url }),
+            });
+            const pct = proxyRes.headers.get("content-type") || "";
+            if (pct.includes("application/json")) {
+              const err = await proxyRes.json();
+              throw new Error(err.error || "Falha no proxy");
+            }
+            if (!proxyRes.ok) throw new Error("Falha no download pelo servidor");
+            const blob = await proxyRes.blob();
+            const obj = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = obj;
+            a.download = data.filename || "video.mp4";
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(obj), 30_000);
+            setStatus("Download iniciado.", "ok");
+            return;
+          }
           throw new Error(data.error || "Resposta inesperada");
         }
 
