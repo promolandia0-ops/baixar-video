@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Baixar vídeo por link — frontend + API yt-dlp."""
+"""Baixar vídeo por link — yt-dlp + fallback HTML (KVS / .mp4 embutido)."""
 from __future__ import annotations
 
 import os
 import re
 import tempfile
+from html import unescape
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
+import requests
 from flask import Flask, jsonify, request, send_file, send_from_directory
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
@@ -17,6 +19,11 @@ app = Flask(__name__, static_folder="static", static_url_path="")
 MAX_URL_LEN = 2048
 TMP_ROOT = Path(tempfile.gettempdir()) / "baixar-video"
 TMP_ROOT.mkdir(parents=True, exist_ok=True)
+
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
 
 YDL_BASE = {
     "quiet": True,
@@ -49,6 +56,133 @@ def _safe_name(title: str | None, ext: str) -> str:
     return f"{base}.{ext}"
 
 
+def _page_title(html: str, fallback: str) -> str:
+    m = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+    if not m:
+        return fallback
+    title = re.sub(r"\s+", " ", unescape(m.group(1))).strip()
+    title = re.split(r"\s*[|\-–—]\s*", title)[0].strip() or fallback
+    return title[:120]
+
+
+def _score_media(u: str) -> int:
+    low = u.lower()
+    score = 0
+    if "720p" in low or "_720" in low:
+        score += 30
+    if "1080" in low:
+        score += 40
+    if "480p" in low or "_480" in low:
+        score += 10
+    if "preview" in low or "trailer" in low or ".jpg" in low:
+        score -= 100
+    if "/get_file/" in low:
+        score += 20
+    if low.endswith(".m3u8") or ".m3u8?" in low:
+        score += 5
+    if ".mp4" in low:
+        score += 15
+    return score
+
+
+def _extract_html_media(page_url: str) -> dict | None:
+    """Fallback when yt-dlp fails: scrape direct mp4/m3u8 / KVS video_url."""
+    try:
+        r = requests.get(
+            page_url,
+            headers={"User-Agent": UA, "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8"},
+            timeout=25,
+            allow_redirects=True,
+        )
+        r.raise_for_status()
+    except requests.RequestException:
+        return None
+
+    html = r.text
+    candidates: list[str] = []
+
+    # KVS style: video_url: '...'
+    for m in re.finditer(
+        r"""video_url\s*:\s*['"]([^'"]+)['"]""",
+        html,
+        re.I,
+    ):
+        candidates.append(unescape(m.group(1)))
+
+    # HTML5 <source src="..."> / <video src="...">
+    for m in re.finditer(
+        r"""<(?:source|video)[^>]+src=["']([^"']+)["']""",
+        html,
+        re.I,
+    ):
+        candidates.append(unescape(m.group(1)))
+
+    # Any absolute/relative get_file or media URL in page
+    for m in re.finditer(
+        r"""https?://[^\s"'<>]+?\.(?:mp4|m3u8|webm)(?:\?[^\s"'<>]*)?""",
+        html,
+        re.I,
+    ):
+        candidates.append(unescape(m.group(0)))
+
+    for m in re.finditer(
+        r"""["'](/[^"']*?get_file/[^"']+\.mp4[^"']*)["']""",
+        html,
+        re.I,
+    ):
+        candidates.append(unescape(m.group(1)))
+
+    # function_get_file / kt_player flashvars variants
+    for m in re.finditer(
+        r"""['"](/(?:get_file|contents)[^'"]+\.mp4[^'"]*)['"]""",
+        html,
+        re.I,
+    ):
+        candidates.append(unescape(m.group(1)))
+
+    abs_urls: list[str] = []
+    seen: set[str] = set()
+    for c in candidates:
+        c = c.strip()
+        if not c or c.startswith("data:"):
+            continue
+        full = urljoin(page_url, c)
+        if full in seen:
+            continue
+        seen.add(full)
+        if not re.search(r"\.(mp4|m3u8|webm)(\?|$)", full, re.I):
+            continue
+        abs_urls.append(full)
+
+    if not abs_urls:
+        return None
+
+    abs_urls.sort(key=_score_media, reverse=True)
+    best = abs_urls[0]
+    if _score_media(best) < 0:
+        return None
+
+    title = _page_title(html, urlparse(page_url).path.rstrip("/").split("/")[-1] or "video")
+    thumb = None
+    tm = re.search(
+        r"""(?:og:image|twitter:image)["']\s+content=["']([^"']+)["']""",
+        html,
+        re.I,
+    ) or re.search(r"""content=["']([^"']+)["'][^>]+(?:og:image|twitter:image)""", html, re.I)
+    if tm:
+        thumb = urljoin(page_url, unescape(tm.group(1)))
+
+    return {
+        "title": title,
+        "url": best,
+        "thumbnail": thumb,
+        "extractor": "html-fallback",
+        "webpage_url": page_url,
+        "ext": "mp4" if ".mp4" in best.lower() else ("m3u8" if ".m3u8" in best.lower() else "webm"),
+        "candidates": abs_urls[:5],
+    }
+
+
 @app.get("/")
 def index():
     return send_from_directory(app.static_folder, "index.html")
@@ -67,45 +201,46 @@ def api_info():
     except ValueError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
 
-    opts = {
-        **YDL_BASE,
-        "skip_download": True,
-    }
+    opts = {**YDL_BASE, "skip_download": True}
     try:
         with YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
+        if info and info.get("_type") == "playlist":
+            entries = [e for e in (info.get("entries") or []) if e]
+            if not entries:
+                return jsonify({"ok": False, "error": "Isso parece uma lista, não um vídeo só."}), 422
+            info = entries[0]
+        return jsonify(
+            {
+                "ok": True,
+                "title": info.get("title") or "Vídeo",
+                "duration": info.get("duration"),
+                "thumbnail": info.get("thumbnail"),
+                "extractor": info.get("extractor_key") or info.get("extractor"),
+                "webpage_url": info.get("webpage_url") or url,
+            }
+        )
     except DownloadError as e:
+        fb = _extract_html_media(url)
+        if fb:
+            return jsonify(
+                {
+                    "ok": True,
+                    "title": fb["title"],
+                    "duration": None,
+                    "thumbnail": fb.get("thumbnail"),
+                    "extractor": fb["extractor"],
+                    "webpage_url": url,
+                }
+            )
         msg = str(e).split("\n")[-1][:300]
         return jsonify({"ok": False, "error": f"Não consegui ler esse link. {msg}"}), 422
     except Exception as e:  # noqa: BLE001
         return jsonify({"ok": False, "error": f"Erro: {e}"}), 500
 
-    if not info:
-        return jsonify({"ok": False, "error": "Nada encontrado nesse link."}), 422
-
-    # playlist guard
-    if info.get("_type") == "playlist":
-        entries = info.get("entries") or []
-        if entries:
-            info = entries[0]
-        else:
-            return jsonify({"ok": False, "error": "Isso parece uma lista, não um vídeo só."}), 422
-
-    return jsonify(
-        {
-            "ok": True,
-            "title": info.get("title") or "Vídeo",
-            "duration": info.get("duration"),
-            "thumbnail": info.get("thumbnail"),
-            "extractor": info.get("extractor_key") or info.get("extractor"),
-            "webpage_url": info.get("webpage_url") or url,
-        }
-    )
-
 
 @app.post("/api/download")
 def api_download():
-    """Resolve o melhor arquivo e devolve link direto (redirect) ou o arquivo."""
     data = request.get_json(silent=True) or {}
     try:
         url = _clean_url(data.get("url", ""))
@@ -116,51 +251,56 @@ def api_download():
     if mode not in ("video", "audio"):
         mode = "video"
 
-    # 1) tentar URL direta (rápido, não passa pelo servidor)
     if mode == "video":
-        # prefer progressive single file; fall back to any best
         fmt = "b[ext=mp4]/b[ext=webm]/b/best"
     else:
         fmt = "bestaudio/best"
 
-    opts_g = {
-        **YDL_BASE,
-        "format": fmt,
-    }
+    # 1) yt-dlp direct URL
     try:
-        with YoutubeDL(opts_g) as ydl:
+        with YoutubeDL({**YDL_BASE, "format": fmt}) as ydl:
             info = ydl.extract_info(url, download=False)
             if info and info.get("_type") == "playlist":
                 entries = [e for e in (info.get("entries") or []) if e]
                 if not entries:
                     return jsonify({"ok": False, "error": "Lista vazia."}), 422
                 info = entries[0]
-            # requested downloads may be multiple (video+audio)
             req = info.get("requested_formats") or []
             if len(req) <= 1:
                 direct = info.get("url")
-                if direct and not info.get("is_live"):
-                    # some URLs need headers; prefer proxy download then
-                    http_headers = info.get("http_headers") or {}
-                    # If cookies/headers critical, fall through to server download
-                    needs_headers = bool(http_headers.get("Authorization") or http_headers.get("Cookie"))
-                    if not needs_headers and direct.startswith("http"):
-                        return jsonify(
-                            {
-                                "ok": True,
-                                "method": "redirect",
-                                "url": direct,
-                                "filename": _safe_name(info.get("title"), info.get("ext") or "mp4"),
-                                "title": info.get("title") or "Vídeo",
-                            }
-                        )
-    except DownloadError as e:
-        msg = str(e).split("\n")[-1][:300]
-        return jsonify({"ok": False, "error": f"Não consegui baixar. {msg}"}), 422
+                http_headers = info.get("http_headers") or {}
+                needs_headers = bool(http_headers.get("Authorization") or http_headers.get("Cookie"))
+                if direct and not info.get("is_live") and not needs_headers and direct.startswith("http"):
+                    return jsonify(
+                        {
+                            "ok": True,
+                            "method": "redirect",
+                            "url": direct,
+                            "filename": _safe_name(info.get("title"), info.get("ext") or "mp4"),
+                            "title": info.get("title") or "Vídeo",
+                        }
+                    )
+    except DownloadError:
+        # fall through to HTML / server download
+        pass
     except Exception as e:  # noqa: BLE001
         return jsonify({"ok": False, "error": f"Erro: {e}"}), 500
 
-    # 2) baixar no servidor (merge se preciso)
+    # 2) HTML fallback (KVS / embedded mp4) — video mode only
+    if mode == "video":
+        fb = _extract_html_media(url)
+        if fb and fb.get("url"):
+            return jsonify(
+                {
+                    "ok": True,
+                    "method": "redirect",
+                    "url": fb["url"],
+                    "filename": _safe_name(fb.get("title"), fb.get("ext") or "mp4"),
+                    "title": fb.get("title") or "Vídeo",
+                }
+            )
+
+    # 3) server-side download/merge
     outtmpl = str(TMP_ROOT / "%(id)s.%(ext)s")
     opts_dl = {
         **YDL_BASE,
@@ -185,13 +325,11 @@ def api_download():
                 entries = [e for e in (info.get("entries") or []) if e]
                 info = entries[0] if entries else info
             path = Path(ydl.prepare_filename(info))
-            # audio postprocess changes ext
             if mode == "audio":
                 cand = path.with_suffix(".mp3")
                 if cand.exists():
                     path = cand
             if not path.exists():
-                # try common alts
                 for p in TMP_ROOT.glob(f"{info.get('id')}.*"):
                     path = p
                     break
@@ -199,7 +337,16 @@ def api_download():
                 return jsonify({"ok": False, "error": "Download terminou sem arquivo."}), 500
     except DownloadError as e:
         msg = str(e).split("\n")[-1][:300]
-        return jsonify({"ok": False, "error": f"Não consegui baixar. {msg}"}), 422
+        return jsonify(
+            {
+                "ok": False,
+                "error": (
+                    "Não consegui baixar esse link. "
+                    "Alguns sites protegem o vídeo (login, DRM ou player novo). "
+                    f"{msg}"
+                ),
+            }
+        ), 422
     except Exception as e:  # noqa: BLE001
         return jsonify({"ok": False, "error": f"Erro no download: {e}"}), 500
 
