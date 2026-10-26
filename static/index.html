@@ -77,6 +77,20 @@
     }
     .go:disabled { opacity: 0.55; cursor: wait; }
     .go:active:not(:disabled) { background: var(--accent-press); }
+    .row-btns { display: flex; gap: 8px; margin-top: 6px; }
+    .row-btns .go { margin-top: 0; flex: 1; }
+    .clear {
+      flex: 0 0 auto;
+      padding: 14px 16px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--text);
+      font-size: 1rem;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .clear:active { background: var(--card); }
     .card {
       display: none;
       margin-top: 18px;
@@ -109,7 +123,10 @@
       <button type="button" data-mode="audio" id="modeAudio">Só áudio (MP3)</button>
     </div>
 
-    <button type="button" class="go" id="btn">Baixar</button>
+    <div class="row-btns">
+      <button type="button" class="go" id="btn">Baixar</button>
+      <button type="button" class="clear" id="clear">Limpar</button>
+    </div>
 
     <div class="card" id="card">
       <img id="thumb" alt="" />
@@ -126,6 +143,7 @@
     let mode = "video";
     const urlEl = document.getElementById("url");
     const btn = document.getElementById("btn");
+    const clearBtn = document.getElementById("clear");
     const statusEl = document.getElementById("status");
     const card = document.getElementById("card");
     const thumb = document.getElementById("thumb");
@@ -161,6 +179,7 @@
       }
       btn.disabled = true;
       card.classList.remove("show");
+      urlEl.value = "";
       setStatus("Lendo o link…", "");
       try {
         const infoRes = await fetch("/api/info", {
@@ -263,6 +282,17 @@
       }
     }
 
+    function clearAll() {
+      urlEl.value = "";
+      card.classList.remove("show");
+      thumb.removeAttribute("src");
+      titleEl.textContent = "";
+      metaEl.textContent = "";
+      setStatus("", "");
+      urlEl.focus();
+    }
+
+    clearBtn.addEventListener("click", clearAll);
     btn.addEventListener("click", run);
     urlEl.addEventListener("keydown", (e) => {
       if (e.key === "Enter") run();
