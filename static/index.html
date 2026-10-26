@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f1115" />
+  <title>Baixar vídeo</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f1115;
+      --card: #1a1d24;
+      --border: #2a2f3a;
+      --text: #f2f4f8;
+      --muted: #9aa3b2;
+      --accent: #6ea8fe;
+      --accent-press: #4d8ef0;
+      --ok: #3dd68c;
+      --err: #ff7b72;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100dvh;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      padding: 20px 16px 40px;
+    }
+    main { max-width: 480px; margin: 0 auto; }
+    h1 { font-size: 1.35rem; font-weight: 700; margin: 8px 0 6px; }
+    .sub { color: var(--muted); font-size: 0.95rem; line-height: 1.45; margin: 0 0 20px; }
+    label { display: block; font-size: 0.9rem; margin-bottom: 8px; color: var(--muted); }
+    input[type="url"] {
+      width: 100%;
+      padding: 14px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: var(--card);
+      color: var(--text);
+      font-size: 1rem;
+    }
+    input[type="url"]:focus { outline: 2px solid var(--accent); border-color: transparent; }
+    .modes {
+      display: flex;
+      gap: 8px;
+      margin: 14px 0;
+      flex-wrap: wrap;
+    }
+    .modes button {
+      flex: 1;
+      min-width: 120px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--text);
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .modes button.active {
+      background: var(--accent);
+      color: #0b1220;
+      border-color: transparent;
+    }
+    .go {
+      width: 100%;
+      margin-top: 6px;
+      padding: 14px 16px;
+      border: none;
+      border-radius: 12px;
+      background: var(--accent);
+      color: #0b1220;
+      font-size: 1rem;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .go:disabled { opacity: 0.55; cursor: wait; }
+    .go:active:not(:disabled) { background: var(--accent-press); }
+    .card {
+      display: none;
+      margin-top: 18px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      overflow: hidden;
+    }
+    .card.show { display: block; }
+    .card img { width: 100%; max-height: 220px; object-fit: cover; background: #000; display: block; }
+    .card .body { padding: 12px 14px; }
+    .card h2 { font-size: 1rem; margin: 0 0 6px; font-weight: 650; }
+    .card .meta { font-size: 0.85rem; color: var(--muted); }
+    .status { margin-top: 14px; min-height: 1.3em; font-size: 0.92rem; line-height: 1.4; color: var(--muted); }
+    .status.ok { color: var(--ok); }
+    .status.err { color: var(--err); }
+    .hint { margin-top: 18px; font-size: 0.85rem; color: var(--muted); line-height: 1.45; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Baixar vídeo</h1>
+    <p class="sub">Cola o link da página onde o vídeo aparece. Funciona em muitos sites (YouTube, X, Instagram, TikTok, Vimeo, Facebook e vários outros que o yt-dlp entende). Nem todo site do Google vai dar — se for bloqueado ou protegido, avisa o erro.</p>
+
+    <label for="url">Link do vídeo</label>
+    <input id="url" type="url" inputmode="url" autocomplete="off" placeholder="https://…" />
+
+    <div class="modes" role="group" aria-label="Tipo">
+      <button type="button" class="active" data-mode="video" id="modeVideo">Vídeo</button>
+      <button type="button" data-mode="audio" id="modeAudio">Só áudio (MP3)</button>
+    </div>
+
+    <button type="button" class="go" id="btn">Baixar</button>
+
+    <div class="card" id="card">
+      <img id="thumb" alt="" />
+      <div class="body">
+        <h2 id="title"></h2>
+        <div class="meta" id="meta"></div>
+      </div>
+    </div>
+
+    <p class="status" id="status" aria-live="polite"></p>
+    <p class="hint">Use só com vídeos que você tem direito de baixar. O servidor pode dormir no plano grátis: a primeira vez pode demorar ~30s pra acordar.</p>
+  </main>
+  <script>
+    let mode = "video";
+    const urlEl = document.getElementById("url");
+    const btn = document.getElementById("btn");
+    const statusEl = document.getElementById("status");
+    const card = document.getElementById("card");
+    const thumb = document.getElementById("thumb");
+    const titleEl = document.getElementById("title");
+    const metaEl = document.getElementById("meta");
+
+    document.querySelectorAll(".modes button").forEach((b) => {
+      b.addEventListener("click", () => {
+        document.querySelectorAll(".modes button").forEach((x) => x.classList.remove("active"));
+        b.classList.add("active");
+        mode = b.getAttribute("data-mode");
+      });
+    });
+
+    function setStatus(msg, kind) {
+      statusEl.textContent = msg || "";
+      statusEl.className = "status" + (kind ? " " + kind : "");
+    }
+
+    function fmtDur(sec) {
+      if (!sec && sec !== 0) return "";
+      const s = Math.round(sec);
+      const m = Math.floor(s / 60);
+      const r = s % 60;
+      return m + ":" + String(r).padStart(2, "0");
+    }
+
+    async function run() {
+      const url = (urlEl.value || "").trim();
+      if (!url) {
+        setStatus("Cola um link primeiro.", "err");
+        return;
+      }
+      btn.disabled = true;
+      card.classList.remove("show");
+      setStatus("Lendo o link…", "");
+      try {
+        const infoRes = await fetch("/api/info", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url }),
+        });
+        const info = await infoRes.json();
+        if (!info.ok) throw new Error(info.error || "Falha ao ler o link");
+        titleEl.textContent = info.title || "Vídeo";
+        metaEl.textContent = [info.extractor, fmtDur(info.duration)].filter(Boolean).join(" · ");
+        if (info.thumbnail) {
+          thumb.src = info.thumbnail;
+          thumb.style.display = "block";
+        } else {
+          thumb.removeAttribute("src");
+          thumb.style.display = "none";
+        }
+        card.classList.add("show");
+
+        setStatus("Preparando download…", "");
+        const dlRes = await fetch("/api/download", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url, mode }),
+        });
+
+        const ctype = dlRes.headers.get("content-type") || "";
+        if (ctype.includes("application/json")) {
+          const data = await dlRes.json();
+          if (!data.ok) throw new Error(data.error || "Falha no download");
+          if (data.method === "redirect" && data.url) {
+            setStatus("Abrindo o arquivo…", "ok");
+            const a = document.createElement("a");
+            a.href = data.url;
+            a.download = data.filename || "video.mp4";
+            a.target = "_blank";
+            a.rel = "noopener";
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setStatus("Pronto. Se não baixou, o site de origem bloqueou o link direto — tenta de novo ou outro link.", "ok");
+            return;
+          }
+          throw new Error(data.error || "Resposta inesperada");
+        }
+
+        if (!dlRes.ok) {
+          let msg = "Falha no download";
+          try {
+            const err = await dlRes.json();
+            msg = err.error || msg;
+          } catch (_) {}
+          throw new Error(msg);
+        }
+
+        const blob = await dlRes.blob();
+        const dispo = dlRes.headers.get("content-disposition") || "";
+        let name = mode === "audio" ? "audio.mp3" : "video.mp4";
+        const m = /filename\*?=(?:UTF-8''|")?([^\";]+)/i.exec(dispo);
+        if (m) name = decodeURIComponent(m[1].replace(/"/g, ""));
+        const obj = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = obj;
+        a.download = name;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(obj), 30_000);
+        setStatus("Download iniciado.", "ok");
+      } catch (e) {
+        setStatus(e && e.message ? e.message : String(e), "err");
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    btn.addEventListener("click", run);
+    urlEl.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") run();
+    });
+  </script>
+</body>
+</html>
