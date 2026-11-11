@@ -152,6 +152,8 @@ def _session() -> requests.Session:
         "Accept-Language": "en-US,en;q=0.9,pt-BR,pt;q=0.8",
         "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
     })
+    # Safe search desligado no Bing (além do parâmetro adlt=off).
+    s.cookies.set("SRCHHPGUSR", "ADLT=OFF", domain=".bing.com")
     return s
 
 
@@ -307,12 +309,12 @@ def search_bing_videos(query: str, offset: int = 0) -> list[dict]:
     return out
 
 
-def search_ytdlp(query: str, prefix: str = "ytsearch16", data: dict | None = None) -> list[dict]:
+def search_ytdlp(query: str, prefix: str = "ytsearch30", data: dict | None = None) -> list[dict]:
     from app import _extract_info, _ydl_opts
 
     target = f"{prefix}:{query}"
     opts = _ydl_opts(
-        {"skip_download": True, "noplaylist": False, "extract_flat": "in_playlist", "playlistend": 16},
+        {"skip_download": True, "noplaylist": False, "extract_flat": "in_playlist", "playlistend": 30},
         data_for_url("https://www.youtube.com/", data),
     )
     try:
@@ -395,13 +397,13 @@ def _max_format(info: dict) -> tuple[int, int, int, str | None]:
     return height, width, size, preview
 
 
-def probe(url: str, data: dict | None = None, timeout: int = 18) -> dict | None:
+def probe(url: str, data: dict | None = None, timeout: int = 18, html_fallback: bool = False) -> dict | None:
     from app import _extract_info, _ydl_opts, _extract_html_media
 
     if blocked(url):
         return None
     opts = _ydl_opts(
-        {"skip_download": True, "noplaylist": True, "socket_timeout": min(12, timeout)},
+        {"skip_download": True, "noplaylist": True, "socket_timeout": min(8, timeout)},
         data_for_url(url, data),
     )
     info = None
@@ -413,6 +415,8 @@ def probe(url: str, data: dict | None = None, timeout: int = 18) -> dict | None:
         entries = [e for e in (info.get("entries") or []) if e]
         info = entries[0] if entries else None
     if not info:
+        if not html_fallback:
+            return None
         fb = _extract_html_media(url)
         if not fb:
             return None
@@ -486,23 +490,68 @@ def gather_candidates(query: str, page: int, data: dict | None = None) -> list[d
             seen.add(u)
             found.append(it)
 
-    with ThreadPoolExecutor(max_workers=5) as ex:
+    with ThreadPoolExecutor(max_workers=6) as ex:
         futs = [
             ex.submit(search_duckduckgo, query, offset),
             ex.submit(search_bing, query, offset),
             ex.submit(search_bing_videos, query, offset),
-            ex.submit(search_ytdlp, query, "ytsearch16", data),
+            ex.submit(search_ytdlp, query, "ytsearch30", data),
         ]
         if page == 1:
             futs.append(ex.submit(search_duckduckgo, q4, 0))
             futs.append(ex.submit(search_bing_videos, q4, 0))
-            futs.append(ex.submit(search_ytdlp, q4, "ytsearch8", data))
+            futs.append(ex.submit(search_ytdlp, q4, "ytsearch15", data))
         for fut in as_completed(futs):
             try:
                 add(fut.result())
             except Exception:
                 pass
     return found
+
+
+
+def height_from_title(title: str) -> int:
+    """Palpite de resolução pelo título, usado só quando a sonda falha."""
+    t = title or ""
+    if re.search(r"\b(8k|4320p)\b", t, re.I):
+        return 4320
+    if re.search(r"\b(4k|2160p|uhd)\b", t, re.I):
+        return 2160
+    if re.search(r"\b(1440p|qhd)\b", t, re.I) or re.search(r"\b2k\b", t, re.I):
+        return 1440
+    if re.search(r"\b(1080p|fhd|full\s*hd)\b", t, re.I):
+        return 1080
+    if re.search(r"\b(720p|hd)\b", t, re.I):
+        return 720
+    m = re.search(r"\b(480|360|240)p\b", t, re.I)
+    if m:
+        return int(m.group(1))
+    return 0
+
+
+def candidate_result(it: dict, info: dict | None = None) -> dict:
+    """Monta um resultado mesmo se a sonda de resolução falhar."""
+    url = (info or {}).get("url") or it.get("url") or ""
+    title = (info or {}).get("title") or it.get("title") or url
+    thumb = (info or {}).get("thumbnail") or it.get("thumbnail")
+    dur = (info or {}).get("duration")
+    if dur is None:
+        dur = it.get("duration")
+    height = int((info or {}).get("height") or 0)
+    if height <= 0:
+        height = height_from_title(title)
+    return {
+        "url": url,
+        "title": title,
+        "thumbnail": thumb,
+        "duration": dur,
+        "height": height,
+        "width": int((info or {}).get("width") or 0),
+        "filesize": int((info or {}).get("filesize") or 0),
+        "site": (info or {}).get("site") or site_name(url),
+        "preview": (info or {}).get("preview"),
+        "extractor": (info or {}).get("extractor"),
+    }
 
 
 def _cache_key(query: str, url: str) -> str:
@@ -556,11 +605,13 @@ def run_search(query: str, url: str = "", page: int = 1, data: dict | None = Non
                 if u and u not in seen and not blocked(u):
                     pack["pending"].append(it)
 
-    # sonda em paralelo o próximo lote
+    # Entrega um lote grande de candidatos mesmo se a sonda falhar.
+    # Sonda pesada (yt-dlp em paralelo) derrubava o worker no plano free (HTTP 502) e esvaziava a lista.
+    batch_size = 40 if page == 1 else 24
     batch: list[dict] = []
     with _CACHE_LOCK:
         pending = pack["pending"]
-        while pending and len(batch) < 8:
+        while pending and len(batch) < batch_size:
             it = pending.pop(0)
             u = it.get("url") or ""
             if not u or u in pack["seen"] or blocked(u):
@@ -570,39 +621,25 @@ def run_search(query: str, url: str = "", page: int = 1, data: dict | None = Non
             pack["seen"].add(u)
             batch.append(it)
 
-    probed: list[dict] = []
-    if batch:
-        with ThreadPoolExecutor(max_workers=6) as ex:
-            futs = {ex.submit(probe, it["url"], data, 16): it for it in batch}
-            for fut in as_completed(futs):
-                base = futs[fut]
-                try:
-                    info = fut.result(timeout=20)
-                except Exception:
-                    info = None
-                if not info:
+    hits: list[dict] = []
+    for it in batch:
+        if source and source.get("title"):
+            if not same_video(source["title"], source.get("duration"), it.get("title") or "", it.get("duration"), min_sim=0.35):
+                # sem duração/sonda: ainda assim aceita se o título for parecido o bastante
+                if title_similarity(source["title"], it.get("title") or "") < 0.35:
                     continue
-                # se o usuário colou um link, fica só o mesmo vídeo (título + duração ±3s)
-                if source and source.get("title"):
-                    if not same_video(source["title"], source.get("duration"), info.get("title") or "", info.get("duration")):
-                        continue
-                # mescla título da busca se o probe veio genérico
-                if (not info.get("title") or info["title"] == info["url"]) and base.get("title"):
-                    info["title"] = base["title"]
-                if not info.get("thumbnail") and base.get("thumbnail"):
-                    info["thumbnail"] = base["thumbnail"]
-                if info.get("duration") is None and base.get("duration") is not None:
-                    info["duration"] = base["duration"]
-                probed.append(info)
+        hits.append(candidate_result(it))
 
     with _CACHE_LOCK:
-        pack["done"].extend(probed)
+        pack["done"].extend(hits)
         pack["ts"] = time.time()
         all_hits = list(pack["done"])
-        has_more = bool(pack["pending"]) or page < 5
+        has_more = bool(pack["pending"]) or page < 8
         src = pack.get("source") or source
 
     all_hits.sort(key=lambda r: (int(r.get("height") or 0), float(r.get("duration") or 0)), reverse=True)
+    if not all_hits:
+        return {"ok": False, "error": "Não achei vídeos com essa busca agora. Tente de novo em instantes.", "query": query, "page": page, "has_more": False, "results": []}
     return {
         "ok": True,
         "query": query,
