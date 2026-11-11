@@ -261,6 +261,13 @@ def api_info():
             if not entries:
                 return jsonify({"ok": False, "error": "Isso parece uma lista, não um vídeo só."}), 422
             info = entries[0]
+        try:
+            from quality import _max_format
+            height, width, size, _preview = _max_format(info)
+        except Exception:
+            height = int(info.get("height") or 0)
+            width = int(info.get("width") or 0)
+            size = 0
         return jsonify(
             {
                 "ok": True,
@@ -269,6 +276,9 @@ def api_info():
                 "thumbnail": info.get("thumbnail"),
                 "extractor": info.get("extractor_key") or info.get("extractor"),
                 "webpage_url": info.get("webpage_url") or url,
+                "height": height,
+                "width": width,
+                "filesize": size,
             }
         )
     except DownloadError as e:
@@ -302,13 +312,17 @@ def api_download():
     if mode not in ("video", "audio"):
         mode = "video"
 
+    want_best = str(data.get("quality") or "").strip().lower() in ("best", "bestmerge", "4k", "max")
     if mode == "video":
-        fmt = "b[ext=mp4]/b[ext=webm]/b/best"
+        # quality=best: força bestvideo+bestaudio (4K + áudio), em vez de um único arquivo 1080p.
+        fmt = "bv*+ba/b/best" if want_best else "b[ext=mp4]/b[ext=webm]/b/best"
     else:
         fmt = "bestaudio/best"
 
-    # 1) yt-dlp direct URL
+    # 1) yt-dlp direct URL (pula o atalho de um arquivo só quando pediram a melhor qualidade)
     try:
+        if want_best and mode == "video":
+            raise DownloadError("prefer merge")
         info = _extract_info(url, _ydl_opts({"format": fmt}, data), download=False)
         if info and info.get("_type") == "playlist":
             entries = [e for e in (info.get("entries") or []) if e]
@@ -576,6 +590,37 @@ def api_search():
     if not results:
         return jsonify({"ok": False, "error": "Nenhum vídeo encontrado com esse nome."}), 422
     return jsonify({"ok": True, "results": results, "title": info.get("title") or query})
+
+
+
+
+@app.post("/api/quality")
+def api_quality():
+    """Busca ampla (web + yt-dlp), sem filtro de idade, e sonda a resolução real de cada candidato."""
+    data = request.get_json(silent=True) or {}
+    query = (data.get("query") or data.get("q") or "").strip()
+    url = (data.get("url") or "").strip()
+    try:
+        page = int(data.get("page") or 1)
+    except (TypeError, ValueError):
+        page = 1
+    if query and len(query) > 240:
+        return jsonify({"ok": False, "error": "Busca grande demais."}), 400
+    from quality import blocked, run_search
+    if url:
+        try:
+            url = _clean_url(url)
+        except ValueError as e:
+            return jsonify({"ok": False, "error": str(e)}), 400
+        if blocked(url):
+            return jsonify({"ok": False, "error": "Esse site não é permitido (vazamento ou pirataria)."}), 400
+    try:
+        result = run_search(query, url=url, page=page, data=data)
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"ok": False, "error": f"Erro na busca: {e}"}), 500
+    if not result.get("ok"):
+        return jsonify(result), 422
+    return jsonify(result)
 
 
 
