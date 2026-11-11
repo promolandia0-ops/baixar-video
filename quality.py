@@ -1024,6 +1024,14 @@ def run_search(query: str, url: str = "", page: int = 1, data: dict | None = Non
         int(r.get("height") or 0),
         float(r.get("duration") or 0),
     ), reverse=True)
+    # Buscas específicas: se já houver título que bata, esconde o resto.
+    # Buscas genéricas (pelada, homem, etc.) permanecem amplas para não esvaziar a lista.
+    if _should_require_relevance(qref):
+        relevant = [r for r in all_hits if _relevant(r.get("title") or "", r.get("url") or "", qref)]
+        if relevant:
+            all_hits = relevant
+        elif pending_flag:
+            all_hits = []
     if not all_hits and pending_flag:
         return {
             "ok": True,
