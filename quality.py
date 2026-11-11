@@ -500,6 +500,9 @@ def gather_candidates(query: str, page: int, data: dict | None = None) -> list[d
             # ignora arquivos que claramente não são página/vídeo
             if re.search(r"\.(pdf|docx?|zip|rar|exe|apk|css|js)(\?|$)", u, re.I):
                 continue
+            src = it.get("source") or ""
+            if src not in ("ytsearch", "bing-video") and not is_video_url(u):
+                continue
             if query and _should_require_relevance(query) and not _relevant(it.get("title") or "", u, query):
                 continue
             seen.add(u)
@@ -523,6 +526,23 @@ def gather_candidates(query: str, page: int, data: dict | None = None) -> list[d
                 pass
     return found
 
+
+
+
+_VIDEO_HOSTS = (
+    "youtube.com", "youtu.be", "youtube-nocookie.com", "vimeo.com", "dailymotion.com",
+    "tiktok.com", "instagram.com", "reddit.com", "redd.it", "x.com", "twitter.com",
+    "facebook.com", "fb.watch", "twitch.tv", "rumble.com", "bitchute.com", "odysee.com",
+    "archive.org", "blender.org", "pornhub.com", "xvideos.com", "xhamster.com", "xnxx.com",
+    "redtube.com", "youporn.com", "spankbang.com", "xhwebsite.com",
+)
+
+
+def is_video_url(url: str) -> bool:
+    h = _norm_host(url)
+    if any(h == d or h.endswith("." + d) for d in _VIDEO_HOSTS):
+        return True
+    return bool(re.search(r"\.(mp4|webm|m3u8|mkv|mov)(\?|$)", url or "", re.I))
 
 
 def height_from_title(title: str) -> int:
@@ -652,7 +672,7 @@ def run_search(query: str, url: str = "", page: int = 1, data: dict | None = Non
         has_more = bool(pack["pending"]) or page < 8
         src = pack.get("source") or source
 
-    all_hits.sort(key=lambda r: (int(r.get("height") or 0), float(r.get("duration") or 0)), reverse=True)
+    all_hits.sort(key=lambda r: (1 if is_video_url(r.get("url") or "") else 0, int(r.get("height") or 0), float(r.get("duration") or 0)), reverse=True)
     if not all_hits:
         return {"ok": False, "error": "Não achei vídeos com essa busca agora. Tente de novo em instantes.", "query": query, "page": page, "has_more": False, "results": []}
     return {
