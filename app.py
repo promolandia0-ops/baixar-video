@@ -588,6 +588,25 @@ def api_search():
         if len(results) >= 30:
             break
     if not results:
+        try:
+            from quality import run_search
+            qres = run_search(query, page=1, data=data)
+        except Exception:
+            qres = {}
+        if qres.get("ok") and qres.get("results"):
+            fallback = []
+            for r in qres["results"][:30]:
+                u = r.get("url") or ""
+                if not u:
+                    continue
+                fallback.append({
+                    "title": r.get("title") or "Vídeo",
+                    "url": u,
+                    "thumbnail": r.get("thumbnail"),
+                    "duration": r.get("duration"),
+                })
+            if fallback:
+                return jsonify({"ok": True, "results": fallback, "title": query, "pending": bool(qres.get("pending"))})
         return jsonify({"ok": False, "error": "Nenhum vídeo encontrado com esse nome."}), 422
     return jsonify({"ok": True, "results": results, "title": info.get("title") or query})
 
@@ -600,6 +619,7 @@ def api_quality():
     data = request.get_json(silent=True) or {}
     query = (data.get("query") or data.get("q") or "").strip()
     url = (data.get("url") or "").strip()
+    site = (data.get("site") or "").strip()
     try:
         page = int(data.get("page") or 1)
     except (TypeError, ValueError):
@@ -615,7 +635,7 @@ def api_quality():
         if blocked(url):
             return jsonify({"ok": False, "error": "Esse site não é permitido (vazamento ou pirataria)."}), 400
     try:
-        result = run_search(query, url=url, page=page, data=data)
+        result = run_search(query, url=url, page=page, data=data, site=site)
     except Exception as e:  # noqa: BLE001
         return jsonify({"ok": False, "error": f"Erro na busca: {e}"}), 500
     if not result.get("ok"):

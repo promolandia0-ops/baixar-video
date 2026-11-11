@@ -6,6 +6,7 @@ Sites de vazamento e pirataria entram na blocklist e são descartados.
 """
 from __future__ import annotations
 
+import json
 import re
 import threading
 import time
@@ -464,68 +465,79 @@ def probe(url: str, data: dict | None = None, timeout: int = 18, html_fallback: 
 _GENERIC_QUERIES = {
     "homem", "mulher", "man", "men", "woman", "women", "girl", "girls", "boy", "boys",
     "sexo", "sex", "porn", "porno", "adulto", "adult", "nsfw", "video", "videos", "filme",
-    "movie", "movies", "clipe", "clip", "oficial", "official",
+    "movie", "movies", "clipe", "clip", "oficial", "official", "pelada", "pelado", "nua",
+    "nu", "naked", "nude", "nudes",
+}
+
+_STOP = {
+    "de", "da", "do", "das", "dos", "e", "em", "a", "o", "as", "os", "um", "uma",
+    "the", "and", "of", "for", "com", "pra", "para", "no", "na", "nos", "nas",
+    "por", "que", "se", "ao", "la", "el", "los", "las",
 }
 
 
+def _tokens(s: str) -> list[str]:
+    return [w for w in normalize_title(s or "").split() if w]
+
+
+def _significant(words: list[str]) -> list[str]:
+    sig = [w for w in words if len(w) >= 3 and w not in _STOP]
+    return sig or [w for w in words if w]
+
+
+def _levenshtein(a: str, b: str) -> int:
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    if abs(len(a) - len(b)) > 2:
+        return 3
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[-1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def _token_hit(q: str, hay: set[str], blob: str) -> int:
+    if not q:
+        return 0
+    if q in hay or q in blob:
+        return 2
+    if any(q in h or (len(h) >= 4 and h in q) for h in hay):
+        return 2
+    if len(q) >= 4 and any(h.startswith(q[:4]) or (len(h) >= 4 and q.startswith(h[:4])) for h in hay):
+        return 1
+    maxd = 2 if len(q) >= 7 else 1 if len(q) >= 5 else 0
+    if maxd and any(abs(len(h) - len(q)) <= maxd and _levenshtein(h, q) <= maxd for h in hay):
+        return 1
+    return 0
+
+
+def match_score(query: str, title: str, url: str = "") -> int:
+    q = _significant(_tokens(query))
+    if not q:
+        return 1
+    hay = set(_tokens(title) + _tokens((url or "").replace("-", " ").replace("_", " ")))
+    blob = normalize_title((title or "") + " " + (url or ""))
+    return sum(_token_hit(t, hay, blob) for t in q)
+
+
 def _should_require_relevance(query: str) -> bool:
-    toks = [w for w in normalize_title(query).split() if len(w) >= 3]
+    toks = _significant(_tokens(query))
     if len(toks) >= 2:
         return True
     return bool(toks) and toks[0] not in _GENERIC_QUERIES and len(toks[0]) >= 4
 
 
 def _relevant(title: str, url: str, query: str) -> bool:
-    toks = [w for w in normalize_title(query).split() if len(w) >= 3]
-    if not toks:
+    if not query:
         return True
-    blob = normalize_title((title or "") + " " + (url or ""))
-    hit = sum(1 for w in toks if w in blob)
-    need = 1 if len(toks) == 1 else min(2, len(toks))
-    return hit >= need
-
-
-def gather_candidates(query: str, page: int, data: dict | None = None) -> list[dict]:
-    """Junta DDG + Bing + ytsearch, sem filtro de idade, com blocklist."""
-    offset = max(0, (page - 1) * 10)
-    q4 = query if re.search(r"\b(4k|2160p|1080p|uhd)\b", query, re.I) else f"{query} 4k"
-    found: list[dict] = []
-    seen: set[str] = set()
-
-    def add(items: list[dict]) -> None:
-        for it in items:
-            u = it.get("url") or ""
-            if not u or blocked(u) or u in seen:
-                continue
-            # ignora arquivos que claramente não são página/vídeo
-            if re.search(r"\.(pdf|docx?|zip|rar|exe|apk|css|js)(\?|$)", u, re.I):
-                continue
-            src = it.get("source") or ""
-            if src not in ("ytsearch", "bing-video") and not is_video_url(u):
-                continue
-            if query and _should_require_relevance(query) and not _relevant(it.get("title") or "", u, query):
-                continue
-            seen.add(u)
-            found.append(it)
-
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        futs = [
-            ex.submit(search_duckduckgo, query, offset),
-            ex.submit(search_bing, query, offset),
-            ex.submit(search_bing_videos, query, offset),
-            ex.submit(search_ytdlp, query, "ytsearch30", data),
-        ]
-        if page == 1:
-            futs.append(ex.submit(search_duckduckgo, q4, 0))
-            futs.append(ex.submit(search_bing_videos, q4, 0))
-            futs.append(ex.submit(search_ytdlp, q4, "ytsearch15", data))
-        for fut in as_completed(futs):
-            try:
-                add(fut.result())
-            except Exception:
-                pass
-    return found
-
+    return match_score(query, title, url) > 0
 
 
 
@@ -574,7 +586,7 @@ def candidate_result(it: dict, info: dict | None = None) -> dict:
         dur = it.get("duration")
     height = int((info or {}).get("height") or 0)
     if height <= 0:
-        height = height_from_title(title)
+        height = int(it.get("height") or 0) or height_from_title(title)
     return {
         "url": url,
         "title": title,
@@ -589,23 +601,339 @@ def candidate_result(it: dict, info: dict | None = None) -> dict:
     }
 
 
-def _cache_key(query: str, url: str) -> str:
-    return (query or "").strip().lower() + "||" + (url or "").strip()
+def _accept_candidate(it: dict) -> bool:
+    u = it.get("url") or ""
+    if not u or blocked(u):
+        return False
+    if re.search(r"\.(pdf|docx?|zip|rar|exe|apk|css|js)(\?|$)", u, re.I):
+        return False
+    src = it.get("source") or ""
+    if src in ("ytsearch", "bing-video", "pornhub", "xvideos", "xhamster", "xnxx", "site"):
+        return True
+    return is_video_url(u)
 
 
-def run_search(query: str, url: str = "", page: int = 1, data: dict | None = None) -> dict:
-    """Página 1: metadados do link (se houver) + busca + sonda de resolução.
-    Páginas seguintes: mais candidatos do cache / nova rodada de busca.
+def _site_host(site: str) -> str:
+    s = (site or "").strip()
+    if not s:
+        return ""
+    if "://" not in s:
+        s = "https://" + s
+    h = (urlparse(s).hostname or "").lower()
+    if h.startswith("www."):
+        h = h[4:]
+    return h
+
+
+def _thumb_near(html: str, pos: int, patterns: tuple[str, ...]) -> str | None:
+    chunk = html[max(0, pos - 800): pos + 800]
+    for pat in patterns:
+        m = re.search(pat, chunk, re.I)
+        if m:
+            return unescape(m.group(1))
+    return None
+
+
+def search_pornhub(query: str, page: int = 1) -> list[dict]:
+    s = _session()
+    params: dict[str, str | int] = {"search": query}
+    if page > 1:
+        params["page"] = page
+    html = ""
+    for base in ("https://www.pornhub.com/video/search", "https://pt.pornhub.com/video/search"):
+        try:
+            r = s.get(base, params=params, timeout=6)
+            if r.status_code == 200 and "viewkey=" in (r.text or ""):
+                html = unescape(r.text or "")
+                break
+        except Exception:
+            continue
+    out: list[dict] = []
+    seen: set[str] = set()
+    for m in re.finditer(r'href="(/view_video\.php\?viewkey=[a-zA-Z0-9]+)"[^>]*title="([^"]+)"', html):
+        url = urljoin("https://www.pornhub.com", m.group(1))
+        if url in seen:
+            continue
+        seen.add(url)
+        title = unescape(m.group(2))
+        thumb = _thumb_near(html, m.start(), (r'data-mediumthumb="([^"]+)"', r'data-thumb_url="([^"]+)"', r'src="(https://[^"]*phncdn[^"]+)"'))
+        out.append({"url": url, "title": title, "thumbnail": thumb, "duration": None, "source": "pornhub", "height": height_from_title(title)})
+    return out
+
+
+def search_xvideos(query: str, page: int = 1) -> list[dict]:
+    s = _session()
+    params: dict[str, str | int] = {"k": query}
+    if page > 1:
+        params["p"] = page - 1
+    try:
+        r = s.get("https://www.xvideos.com/", params=params, timeout=6)
+        html = unescape(r.text or "")
+    except Exception:
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for m in re.finditer(r'<a[^>]+href="(/video[./][^"]+)"[^>]*title="([^"]+)"', html):
+        href = m.group(1).split("#")[0]
+        url = urljoin("https://www.xvideos.com", href)
+        if url in seen:
+            continue
+        seen.add(url)
+        title = unescape(m.group(2))
+        thumb = _thumb_near(html, m.start(), (r'data-src="(https://[^"]+)"', r'src="(https://[^"]*xvideos-cdn[^"]+)"'))
+        out.append({"url": url, "title": title, "thumbnail": thumb, "duration": None, "source": "xvideos", "height": height_from_title(title)})
+    return out
+
+
+def search_xnxx(query: str, page: int = 1) -> list[dict]:
+    s = _session()
+    path = "https://www.xnxx.com/search/" + quote_plus(query)
+    if page > 1:
+        path = path + "/" + str(page)
+    try:
+        r = s.get(path, timeout=6)
+        html = unescape(r.text or "")
+    except Exception:
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for m in re.finditer(r'<a[^>]+href="(/video-[^"]+)"[^>]*title="([^"]+)"', html):
+        url = urljoin("https://www.xnxx.com", m.group(1).split("#")[0])
+        if url in seen:
+            continue
+        seen.add(url)
+        title = unescape(m.group(2))
+        thumb = _thumb_near(html, m.start(), (r'data-src="(https://[^"]+)"', r'src="(https://[^"]*xnxx-cdn[^"]+)"'))
+        out.append({"url": url, "title": title, "thumbnail": thumb, "duration": None, "source": "xnxx", "height": height_from_title(title)})
+    return out
+
+
+def search_xhamster(query: str, page: int = 1) -> list[dict]:
+    s = _session()
+    url = "https://xhamster.com/search/" + quote_plus(query)
+    if page > 1:
+        url += f"?page={page}"
+    try:
+        r = s.get(url, timeout=6)
+        html = unescape(r.text or "")
+    except Exception:
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for m in re.finditer(r'"pageURL":"(https:\\/\\/xhamster\.com\\/videos\\/[^"]+)"', html):
+        page_url = m.group(1).replace("\\/", "/")
+        if page_url in seen:
+            continue
+        seen.add(page_url)
+        chunk = html[max(0, m.start() - 600): m.start() + 400]
+        tm = list(re.finditer(r'"title":"((?:\\.|[^"\\])*)"', chunk))
+        title = ""
+        if tm:
+            raw_t = tm[-1].group(1)
+            try:
+                title = json.loads('"' + raw_t + '"')
+            except Exception:
+                title = raw_t.replace("\\/", "/").replace('\\"', '"')
+        if not title:
+            title = page_url.rsplit("/", 1)[-1].replace("-", " ")
+        dur = None
+        dm = re.search(r'"duration":(\d+)', chunk)
+        if dm:
+            dur = int(dm.group(1))
+        thumb = None
+        um = re.search(r'"thumbURL":"(https:\\/\\/[^"]+)"', chunk)
+        if um:
+            thumb = um.group(1).replace("\\/", "/")
+        out.append({"url": page_url, "title": title, "thumbnail": thumb, "duration": dur, "source": "xhamster", "height": height_from_title(title)})
+    if not out:
+        for href, title in re.findall(r'href="(https://xhamster\.com/videos/[^"?]+)"[^>]*(?:title|alt)="([^"]{3,200})"', html):
+            if href in seen:
+                continue
+            seen.add(href)
+            out.append({"url": href, "title": unescape(title), "thumbnail": None, "duration": None, "source": "xhamster", "height": height_from_title(title)})
+    return out
+
+
+def _tube_for_host(host: str, query: str, page: int):
+    h = host or ""
+    if h == "pornhub.com" or h.endswith(".pornhub.com"):
+        return ("ph", lambda: search_pornhub(query, page))
+    if h == "xvideos.com" or h.endswith(".xvideos.com"):
+        return ("xv", lambda: search_xvideos(query, page))
+    if h == "xnxx.com" or h.endswith(".xnxx.com"):
+        return ("xnxx", lambda: search_xnxx(query, page))
+    if "xhamster" in h:
+        return ("xh", lambda: search_xhamster(query, page))
+    return None
+
+
+def _source_jobs(query: str, site: str, data: dict | None, page: int) -> list[tuple[str, Any]]:
+    jobs: list[tuple[str, Any]] = []
+    host = _site_host(site)
+    offset = max(0, (page - 1) * 10)
+    if host:
+        # Com site= a busca fica restrita àquele domínio; a busca geral é outro pedido, sem site.
+        jobs.append(("site_bingv", lambda: search_bing_videos(f"site:{host} {query}", 0 if page == 1 else offset)))
+        jobs.append(("site_bing", lambda: search_bing(f"site:{host} {query}", offset)))
+        jobs.append(("site_ddg", lambda: search_duckduckgo(f"site:{host} {query}", offset)))
+        tube = _tube_for_host(host, query, page)
+        if tube:
+            jobs.append(tube)
+        return jobs
+    jobs.extend([
+        ("bing", lambda: search_bing_videos(query, offset)),
+        ("ddg", lambda: search_duckduckgo(query, offset)),
+        ("ph", lambda: search_pornhub(query, page)),
+        ("xv", lambda: search_xvideos(query, page)),
+        ("xh", lambda: search_xhamster(query, page)),
+        ("xnxx", lambda: search_xnxx(query, page)),
+        ("yt", lambda: search_ytdlp(query, "ytsearch30" if page == 1 else "ytsearch15", data)),
+    ])
+    if page == 1:
+        q4 = query if re.search(r"\b(4k|2160p|1080p|uhd)\b", query, re.I) else f"{query} 4k"
+        jobs.append(("bing4k", lambda: search_bing_videos(q4, 0)))
+    return jobs
+
+
+def _on_site(url: str, host: str) -> bool:
+    if not host:
+        return True
+    h = _norm_host(url)
+    return h == host or h.endswith("." + host)
+
+
+def _ingest(pack: dict[str, Any], items: list[dict]) -> int:
+    added = 0
+    host = pack.get("site") or ""
+    with _CACHE_LOCK:
+        seen = pack["seen"]
+        for it in items or []:
+            if not _accept_candidate(it):
+                continue
+            u = (it.get("url") or "").strip()
+            if not u or u in seen:
+                continue
+            if host and not _on_site(u, host):
+                continue
+            seen.add(u)
+            pack["pending"].append(it)
+            added += 1
+        if added:
+            pack["event"].set()
+    return added
+
+
+def _source_worker(pack: dict[str, Any], fn) -> None:
+    try:
+        _ingest(pack, fn() or [])
+    except Exception:
+        pass
+    finally:
+        with _CACHE_LOCK:
+            pack["inflight"] = max(0, int(pack.get("inflight") or 1) - 1)
+            if pack["inflight"] <= 0:
+                pack["finished"] = True
+            pack["event"].set()
+
+
+def _start_jobs(pack: dict[str, Any], query: str, site: str, data: dict | None, page: int) -> None:
+    jobs = _source_jobs(query, site, data, page)
+    with _CACHE_LOCK:
+        pack["finished"] = False
+        pack["inflight"] = int(pack.get("inflight") or 0) + len(jobs)
+    for _name, fn in jobs:
+        threading.Thread(target=_source_worker, args=(pack, fn), daemon=True).start()
+
+
+def _wait_until(pack: dict[str, Any], timeout: float, min_count: int) -> None:
+    deadline = time.time() + max(0.0, timeout)
+    while time.time() < deadline:
+        with _CACHE_LOCK:
+            n = len(pack.get("pending") or []) + len(pack.get("done") or [])
+            fin = bool(pack.get("finished"))
+        if n >= min_count or fin:
+            return
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return
+        pack["event"].wait(timeout=min(0.2, remaining))
+        pack["event"].clear()
+
+
+def wait_first(pack: dict[str, Any], timeout: float = 2.5, extra: float = 3.5) -> None:
+    """Devolve assim que chegar um lote, sem esperar a fonte mais lenta."""
+    _wait_until(pack, timeout, min_count=4)
+    with _CACHE_LOCK:
+        n = len(pack.get("pending") or []) + len(pack.get("done") or [])
+        fin = bool(pack.get("finished"))
+    if n or fin:
+        return
+    _wait_until(pack, extra, min_count=1)
+
+
+def _cache_key(query: str, url: str, site: str = "") -> str:
+    return (query or "").strip().lower() + "||" + (url or "").strip() + "||" + (site or "").strip().lower()
+
+
+def _new_pack(query: str, source: dict | None, site: str) -> dict[str, Any]:
+    return {
+        "ts": time.time(),
+        "pending": [],
+        "done": [],
+        "seen": set(),
+        "source": source,
+        "query": query,
+        "site": site,
+        "event": threading.Event(),
+        "inflight": 0,
+        "finished": False,
+        "served": False,
+        "pages_started": set(),
+    }
+
+
+def gather_candidates(query: str, page: int, data: dict | None = None, site: str = "") -> list[dict]:
+    """Junta fontes em paralelo (usado em páginas extras se o lote ao vivo já terminou)."""
+    found: list[dict] = []
+    seen: set[str] = set()
+
+    def add(items: list[dict]) -> None:
+        for it in items:
+            if not _accept_candidate(it):
+                continue
+            u = it.get("url") or ""
+            if not u or u in seen:
+                continue
+            seen.add(u)
+            found.append(it)
+
+    jobs = _source_jobs(query, site, data, page)
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(jobs)))) as ex:
+        futs = [ex.submit(fn) for _name, fn in jobs]
+        for fut in as_completed(futs):
+            try:
+                add(fut.result())
+            except Exception:
+                pass
+    return found
+
+
+def run_search(query: str, url: str = "", page: int = 1, data: dict | None = None, site: str = "") -> dict:
+    """Inicia todas as fontes em paralelo e devolve o primeiro lote (~1–3 s).
+
+    Resolução vem do título na hora; a sonda pesada fica de fora do primeiro resposta.
+    Pedidos seguintes (mesmo query) leem o cache e os resultados que ainda estavam chegando.
     """
     query = (query or "").strip()
     url = (url or "").strip()
+    site = _site_host(site or (data or {}).get("site") or "")
     page = max(1, int(page or 1))
     if not query and not url:
         return {"ok": False, "error": "Digite o que você quer buscar, ou cole um link."}
     if url and blocked(url):
         return {"ok": False, "error": "Esse site não é permitido (vazamento ou pirataria)."}
 
-    key = _cache_key(query, url)
+    key = _cache_key(query, url, site)
     now = time.time()
     with _CACHE_LOCK:
         pack = _CACHE.get(key)
@@ -614,78 +942,106 @@ def run_search(query: str, url: str = "", page: int = 1, data: dict | None = Non
             pack = None
 
     source = None
-    if url and page == 1:
+    if url and page == 1 and (pack is None or not pack.get("source")) and not query:
+        # Só bloqueia na sonda se não houver texto para buscar: o usuário colou só o link.
         source = probe(url, data=data, timeout=22)
-        if source and not query:
+        if source:
             query = source.get("title") or query
         if not query:
             return {"ok": False, "error": "Não consegui ler esse link para buscar o mesmo vídeo em outra qualidade."}
+        key = _cache_key(query, url, site)
 
     if not query:
         return {"ok": False, "error": "Digite o que você quer buscar."}
 
     if pack is None:
-        cands = gather_candidates(query, 1, data=data)
-        pack = {"ts": now, "pending": cands, "done": [], "seen": set(), "source": source, "query": query}
+        pack = _new_pack(query, source, site)
         with _CACHE_LOCK:
             _CACHE[key] = pack
-    elif page == 1 and not pack.get("done"):
-        pass
-    elif page > 1 and len(pack.get("pending") or []) < 8:
-        more = gather_candidates(pack.get("query") or query, page, data=data)
-        with _CACHE_LOCK:
-            seen = pack["seen"]
-            for it in more:
-                u = it.get("url")
-                if u and u not in seen and not blocked(u):
-                    pack["pending"].append(it)
+        pack["pages_started"].add(page)
+        _start_jobs(pack, query, site, data, page)
+        if url and not pack.get("source"):
+            def _bg_probe(pack_ref: dict[str, Any] = pack) -> None:
+                try:
+                    info = probe(url, data=data, timeout=22)
+                    if info:
+                        with _CACHE_LOCK:
+                            pack_ref["source"] = info
+                except Exception:
+                    pass
+            threading.Thread(target=_bg_probe, daemon=True).start()
+        wait_first(pack, timeout=2.5, extra=3.5)
+    else:
+        if page not in pack.get("pages_started", set()) and (pack.get("finished") or page == 1):
+            pack["pages_started"].add(page)
+            _start_jobs(pack, pack.get("query") or query, site, data, page)
+        if pack.get("served"):
+            wait_first(pack, timeout=0.9, extra=0.0)
+        else:
+            wait_first(pack, timeout=2.5, extra=3.5)
 
-    # Entrega um lote grande de candidatos mesmo se a sonda falhar.
-    # Sonda pesada (yt-dlp em paralelo) derrubava o worker no plano free (HTTP 502) e esvaziava a lista.
-    batch_size = 40 if page == 1 else 24
     batch: list[dict] = []
     with _CACHE_LOCK:
         pending = pack["pending"]
-        while pending and len(batch) < batch_size:
+        while pending:
             it = pending.pop(0)
             u = it.get("url") or ""
-            if not u or u in pack["seen"] or blocked(u):
+            if not u or blocked(u):
                 continue
-            if source and u.rstrip("/") == (source.get("url") or url).rstrip("/"):
+            src = pack.get("source") or source
+            if src and u.rstrip("/") == (src.get("url") or url).rstrip("/"):
                 continue
-            pack["seen"].add(u)
             batch.append(it)
 
     hits: list[dict] = []
+    src = None
+    with _CACHE_LOCK:
+        src = pack.get("source") or source
     for it in batch:
-        if source and source.get("title"):
-            if not same_video(source["title"], source.get("duration"), it.get("title") or "", it.get("duration"), min_sim=0.35):
-                # sem duração/sonda: ainda assim aceita se o título for parecido o bastante
-                if title_similarity(source["title"], it.get("title") or "") < 0.35:
+        if src and src.get("title"):
+            if not same_video(src["title"], src.get("duration"), it.get("title") or "", it.get("duration"), min_sim=0.35):
+                if title_similarity(src["title"], it.get("title") or "") < 0.35:
                     continue
         hits.append(candidate_result(it))
 
     with _CACHE_LOCK:
-        pack["done"].extend(hits)
+        have = {r.get("url") for r in pack["done"]}
+        for h in hits:
+            if h.get("url") and h["url"] not in have:
+                pack["done"].append(h)
+                have.add(h["url"])
         pack["ts"] = time.time()
+        pack["served"] = True
         all_hits = list(pack["done"])
-        has_more = bool(pack["pending"]) or page < 8
+        pending_flag = (not pack.get("finished")) or int(pack.get("inflight") or 0) > 0 or bool(pack.get("pending"))
+        has_more = pending_flag or page < 8
         src = pack.get("source") or source
+        qref = pack.get("query") or query
 
-    qref = pack.get("query") or query
     all_hits.sort(key=lambda r: (
         1 if is_video_url(r.get("url") or "") else 0,
-        1 if _relevant(r.get("title") or "", r.get("url") or "", qref) else 0,
+        match_score(qref, r.get("title") or "", r.get("url") or ""),
         int(r.get("height") or 0),
         float(r.get("duration") or 0),
     ), reverse=True)
+    if not all_hits and pending_flag:
+        return {
+            "ok": True,
+            "query": query,
+            "page": page,
+            "has_more": True,
+            "pending": True,
+            "source": src,
+            "results": [],
+        }
     if not all_hits:
-        return {"ok": False, "error": "Não achei vídeos com essa busca agora. Tente de novo em instantes.", "query": query, "page": page, "has_more": False, "results": []}
+        return {"ok": False, "error": "Não achei vídeos com essa busca agora. Tente de novo em instantes.", "query": query, "page": page, "has_more": False, "pending": False, "results": []}
     return {
         "ok": True,
         "query": query,
         "page": page,
         "has_more": has_more,
+        "pending": pending_flag,
         "source": src,
         "results": all_hits,
     }
