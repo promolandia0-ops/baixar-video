@@ -484,8 +484,7 @@ def gather_candidates(query: str, page: int, data: dict | None = None) -> list[d
             # ignora arquivos que claramente não são página/vídeo
             if re.search(r"\.(pdf|docx?|zip|rar|exe|apk|css|js)(\?|$)", u, re.I):
                 continue
-            src = it.get("source") or ""
-            if query and src not in ("ytsearch", "bing-video") and not _relevant(it.get("title") or "", u, query):
+            if query and _should_require_relevance(query) and not _relevant(it.get("title") or "", u, query):
                 continue
             seen.add(u)
             found.append(it)
