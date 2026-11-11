@@ -32,7 +32,42 @@ YDL_BASE = {
     "noplaylist": True,
     "retries": 3,
     "socket_timeout": 30,
+    "extractor_args": {"youtube": {"player_client": ["android", "ios", "tv", "web"]}},
 }
+
+
+def _ydl_opts(extra: dict | None = None, data: dict | None = None) -> dict:
+    """Opções do yt-dlp, com impersonate Chrome e cookies/UA enviados pelo app."""
+    opts = {**YDL_BASE, **(extra or {})}
+    headers = dict(opts.get("http_headers") or {})
+    if data:
+        ua = (data.get("user_agent") or "").strip()
+        if ua:
+            headers["User-Agent"] = ua
+        ref = (data.get("referer") or "").strip()
+        if ref:
+            headers["Referer"] = ref
+        cookies = (data.get("cookies") or "").strip()
+        if cookies:
+            headers["Cookie"] = cookies
+    if headers:
+        opts["http_headers"] = headers
+    # curl_cffi (já nas dependências): reduz bloqueio de bot no YouTube/X.
+    opts.setdefault("impersonate", "chrome")
+    return opts
+
+
+def _extract_info(url: str, opts: dict, download: bool = False):
+    """Roda o yt-dlp; se o impersonate falhar, tenta de novo sem ele."""
+    try:
+        with YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=download)
+    except Exception:
+        if not opts.get("impersonate"):
+            raise
+        fallback = {k: v for k, v in opts.items() if k != "impersonate"}
+        with YoutubeDL(fallback) as ydl:
+            return ydl.extract_info(url, download=download)
 
 
 def _clean_url(raw: str) -> str:
@@ -127,6 +162,13 @@ def _parse_media_from_html(page_url: str, html: str) -> dict | None:
     ):
         candidates.append(unescape(m.group(1)))
 
+    for m in re.finditer(
+        r"""(?:href|src|content)\s*=\s*['"]([^'"]+?\.(?:mp4|m3u8|webm)(?:\?[^'"]*)?)['"]""",
+        html,
+        re.I,
+    ):
+        candidates.append(unescape(m.group(1)))
+
     abs_urls: list[str] = []
     seen: set[str] = set()
     for c in candidates:
@@ -211,10 +253,9 @@ def api_info():
     except ValueError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
 
-    opts = {**YDL_BASE, "skip_download": True}
+    opts = _ydl_opts({"skip_download": True}, data)
     try:
-        with YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        info = _extract_info(url, opts, download=False)
         if info and info.get("_type") == "playlist":
             entries = [e for e in (info.get("entries") or []) if e]
             if not entries:
@@ -268,28 +309,27 @@ def api_download():
 
     # 1) yt-dlp direct URL
     try:
-        with YoutubeDL({**YDL_BASE, "format": fmt}) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if info and info.get("_type") == "playlist":
-                entries = [e for e in (info.get("entries") or []) if e]
-                if not entries:
-                    return jsonify({"ok": False, "error": "Lista vazia."}), 422
-                info = entries[0]
-            req = info.get("requested_formats") or []
-            if len(req) <= 1:
-                direct = info.get("url")
-                http_headers = info.get("http_headers") or {}
-                needs_headers = bool(http_headers.get("Authorization") or http_headers.get("Cookie"))
-                if direct and not info.get("is_live") and not needs_headers and direct.startswith("http"):
-                    return jsonify(
-                        {
-                            "ok": True,
-                            "method": "redirect",
-                            "url": direct,
-                            "filename": _safe_name(info.get("title"), info.get("ext") or "mp4"),
-                            "title": info.get("title") or "Vídeo",
-                        }
-                    )
+        info = _extract_info(url, _ydl_opts({"format": fmt}, data), download=False)
+        if info and info.get("_type") == "playlist":
+            entries = [e for e in (info.get("entries") or []) if e]
+            if not entries:
+                return jsonify({"ok": False, "error": "Lista vazia."}), 422
+            info = entries[0]
+        req = info.get("requested_formats") or []
+        if len(req) <= 1:
+            direct = info.get("url")
+            http_headers = info.get("http_headers") or {}
+            needs_headers = bool(http_headers.get("Authorization") or http_headers.get("Cookie"))
+            if direct and not info.get("is_live") and not needs_headers and direct.startswith("http"):
+                return jsonify(
+                    {
+                        "ok": True,
+                        "method": "redirect",
+                        "url": direct,
+                        "filename": _safe_name(info.get("title"), info.get("ext") or "mp4"),
+                        "title": info.get("title") or "Vídeo",
+                    }
+                )
     except DownloadError:
         # fall through to HTML / server download
         pass
@@ -333,7 +373,7 @@ def api_download():
         ]
 
     try:
-        with YoutubeDL(opts_dl) as ydl:
+        with YoutubeDL(_ydl_opts(opts_dl, data)) as ydl:
             info = ydl.extract_info(url, download=True)
             if info and info.get("_type") == "playlist":
                 entries = [e for e in (info.get("entries") or []) if e]
