@@ -459,6 +459,22 @@ def probe(url: str, data: dict | None = None, timeout: int = 18, html_fallback: 
 
 
 
+
+# Palavras tão genéricas que o título do vídeo pode não trazê-las (busca ampla, inclusive conteúdo adulto legal).
+_GENERIC_QUERIES = {
+    "homem", "mulher", "man", "men", "woman", "women", "girl", "girls", "boy", "boys",
+    "sexo", "sex", "porn", "porno", "adulto", "adult", "nsfw", "video", "videos", "filme",
+    "movie", "movies", "clipe", "clip", "oficial", "official",
+}
+
+
+def _should_require_relevance(query: str) -> bool:
+    toks = [w for w in normalize_title(query).split() if len(w) >= 3]
+    if len(toks) >= 2:
+        return True
+    return bool(toks) and toks[0] not in _GENERIC_QUERIES and len(toks[0]) >= 4
+
+
 def _relevant(title: str, url: str, query: str) -> bool:
     toks = [w for w in normalize_title(query).split() if len(w) >= 3]
     if not toks:
