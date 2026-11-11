@@ -487,6 +487,99 @@ def api_proxy():
 
 
 
+@app.post("/api/search")
+def api_search():
+    """Busca vídeos no YouTube (ytsearch ou busca do canal) e devolve título, url e miniatura."""
+    data = request.get_json(silent=True) or {}
+    query = (data.get("query") or data.get("q") or "").strip()
+    if not query:
+        return jsonify({"ok": False, "error": "Digite o nome para buscar."}), 400
+    if len(query) > 200:
+        return jsonify({"ok": False, "error": "Nome grande demais."}), 400
+    page = (data.get("url") or "").strip()
+
+    def is_youtube(u: str) -> bool:
+        try:
+            h = (urlparse(u if re.match(r"^https?://", u, re.I) else "https://" + u).hostname or "").lower()
+        except Exception:
+            return False
+        return h.endswith("youtube.com") or h.endswith("youtu.be") or h.endswith("youtube-nocookie.com") or h == "youtu.be"
+
+    def yt_target(site: str, q: str) -> str:
+        s = site or ""
+        from urllib.parse import quote
+        enc = quote(q)
+        m = re.search(r"youtube\.com/(@[\w.-]+)", s, re.I)
+        if m:
+            return f"https://www.youtube.com/{m.group(1)}/search?query={enc}"
+        m = re.search(r"youtube\.com/channel/([\w-]+)", s, re.I)
+        if m:
+            return f"https://www.youtube.com/channel/{m.group(1)}/search?query={enc}"
+        m = re.search(r"youtube\.com/c/([\w.-]+)", s, re.I)
+        if m:
+            return f"https://www.youtube.com/c/{m.group(1)}/search?query={enc}"
+        m = re.search(r"youtube\.com/user/([\w.-]+)", s, re.I)
+        if m:
+            return f"https://www.youtube.com/user/{m.group(1)}/search?query={enc}"
+        return f"ytsearch20:{q}"
+
+    if page and not is_youtube(page) and not page.lower().startswith("ytsearch"):
+        return jsonify({"ok": False, "error": "A busca pelo servidor vale para o YouTube. Nos outros sites o app usa a busca da própria página."}), 422
+
+    target = yt_target(page, query)
+    opts = _ydl_opts(
+        {
+            "skip_download": True,
+            "noplaylist": False,
+            "extract_flat": "in_playlist",
+            "playlistend": 30,
+        },
+        data,
+    )
+    try:
+        info = _extract_info(target, opts, download=False)
+    except DownloadError as e:
+        msg = str(e).split("\n")[-1][:300]
+        return jsonify({"ok": False, "error": f"Não consegui buscar no YouTube. {msg}"}), 422
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"ok": False, "error": f"Erro na busca: {e}"}), 500
+
+    if not info:
+        return jsonify({"ok": False, "error": "Nenhum resultado."}), 422
+    entries = [e for e in (info.get("entries") or []) if e]
+    if not entries and info.get("id"):
+        entries = [info]
+    results = []
+    for e in entries:
+        vid = e.get("id") or ""
+        url = e.get("webpage_url") or e.get("url") or ""
+        if url and not url.startswith("http"):
+            if re.fullmatch(r"[\w-]{11}", url) or re.fullmatch(r"[\w-]{11}", vid):
+                url = f"https://www.youtube.com/watch?v={url if re.fullmatch(r'[\w-]{11}', url) else vid}"
+            else:
+                continue
+        if not url and vid and re.fullmatch(r"[\w-]{11}", vid):
+            url = f"https://www.youtube.com/watch?v={vid}"
+        if not url:
+            continue
+        title = e.get("title") or "Vídeo"
+        thumb = None
+        thumbs = e.get("thumbnails") or []
+        if thumbs:
+            thumb = thumbs[-1].get("url") or thumbs[0].get("url")
+        thumb = thumb or e.get("thumbnail")
+        if not thumb and re.search(r"v=([\w-]{11})", url):
+            thumb = f"https://i.ytimg.com/vi/{re.search(r'v=([\w-]{11})', url).group(1)}/hqdefault.jpg"
+        results.append({"title": title, "url": url, "thumbnail": thumb, "duration": e.get("duration")})
+        if len(results) >= 30:
+            break
+    if not results:
+        return jsonify({"ok": False, "error": "Nenhum vídeo encontrado com esse nome."}), 422
+    return jsonify({"ok": True, "results": results, "title": info.get("title") or query})
+
+
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     app.run(host="0.0.0.0", port=port, debug=False)
