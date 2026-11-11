@@ -672,7 +672,13 @@ def run_search(query: str, url: str = "", page: int = 1, data: dict | None = Non
         has_more = bool(pack["pending"]) or page < 8
         src = pack.get("source") or source
 
-    all_hits.sort(key=lambda r: (1 if is_video_url(r.get("url") or "") else 0, int(r.get("height") or 0), float(r.get("duration") or 0)), reverse=True)
+    qref = pack.get("query") or query
+    all_hits.sort(key=lambda r: (
+        1 if is_video_url(r.get("url") or "") else 0,
+        1 if _relevant(r.get("title") or "", r.get("url") or "", qref) else 0,
+        int(r.get("height") or 0),
+        float(r.get("duration") or 0),
+    ), reverse=True)
     if not all_hits:
         return {"ok": False, "error": "Não achei vídeos com essa busca agora. Tente de novo em instantes.", "query": query, "page": page, "has_more": False, "results": []}
     return {
